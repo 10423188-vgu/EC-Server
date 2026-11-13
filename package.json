@@ -1,0 +1,61 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "engines": {
+    "node": ">=24.22.1 <25"
+  },
+  "description": "",
+  "type": "module",
+  "main": "src/app.js",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "vitest run --config vitest.integration.config.js",
+    "test:all": "npm run test && npm run test:integration",
+    "dev": "prisma generate && nodemon src/server.js",
+    "start:cluster": "pm2 start ecosystem.config.cjs --env production",
+    "seed": "node prisma/seed.js",
+    "backfill:order-images": "node prisma/backfill-order-item-images.js",
+    "backfill:product-min-price": "node prisma/backfill-product-min-price.js",
+    "db:index-wishlist-alerts": "node scripts/ensure-wishlist-alert-index.js",
+    "db:index-mongo": "node scripts/ensure-mongo-indexes.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@elastic/elasticsearch": "^9.4.2",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/auto-instrumentations-node": "^0.79.0",
+    "@opentelemetry/resources": "^2.10.0",
+    "@opentelemetry/sdk-node": "^0.221.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "bcryptjs": "^3.0.3",
+    "cloudinary": "^2.9.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "google-auth-library": "^11.0.2",
+    "helmet": "^8.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongodb": "^7.2.0",
+    "mongoose": "^9.6.2",
+    "multer": "^2.1.0",
+    "pg": "^8.18.0",
+    "pino": "^10.3.1",
+    "redis": "^5.11.0",
+    "resend": "^6.24.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "4.1.12",
+    "mongodb-memory-server": "^11.2.0",
+    "nodemon": "^3.1.11",
+    "prisma": "7.10.1",
+    "vitest": "4.1.12"
+  }
+}

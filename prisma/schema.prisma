@@ -1,0 +1,442 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── IDENTITY & AUTH ──────────────────────────────────────────────────────────
+model User {
+  id                String    @id @default(uuid())
+  name              String
+  reviewDisplayName String?   @db.VarChar(30)
+  reviewAvatar      String?
+  email             String    @unique
+  pendingEmail      String?   @unique
+  // why: nullable — a Google-only account has no password until they set one via
+  // "Forgot password" (resetPassword already just writes a fresh hash either way)
+  password          String?
+  passwordChangedAt DateTime?
+  // why: Google's stable per-account subject id (payload.sub) — unique but nullable,
+  // Postgres allows any number of NULLs under a unique index (only non-null values collide)
+  googleId          String?   @unique
+  phone             String?
+  avatar            String?
+  banner            String?
+  role              Role      @default(CUSTOMER)
+
+  // why: which tier-frame image to display, chosen from tiers the user has already
+  // reached — null means fall back to displaying their real current tier
+  selectedFrame String?
+
+  // why: null = not verified. Set by email verification or Google login when Google
+  // is authoritative for the email; a third-party Google email alone is insufficient.
+  emailVerifiedAt    DateTime?
+  suspendedAt        DateTime?
+  sessionVersion     Int       @default(0)
+  wishlistShareToken String?   @unique
+  wishlistSaleAlerts Boolean   @default(true)
+
+  twoFactorEnabled       Boolean  @default(false)
+  twoFactorSecret        String?
+  twoFactorRecoveryCodes String[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  addresses          Address[]
+  wishlist           Wishlist[]
+  orders             Order[]
+  notifications      Notification[]
+  returnRequests     ReturnRequest[]      @relation("ReturnRequestedBy")
+  inspectedReturns   ReturnRequest[]      @relation("ReturnInspectedBy")
+  confirmedPayments  Payment[]            @relation("PaymentConfirmedBy")
+  orderStatusChanges OrderStatusHistory[] @relation("OrderStatusChangedBy")
+  approvedRefunds    Refund[]             @relation("RefundApprovedBy")
+}
+
+enum Role {
+  CUSTOMER
+  ADMIN
+}
+
+model Address {
+  id          String  @id @default(uuid())
+  userId      String
+  fullName    String
+  phone       String
+  street      String
+  ward        String
+  district    String
+  city        String
+  postalCode  String?
+  countryCode String  @default("VN")
+  isDefault   Boolean @default(false)
+
+  user   User    @relation(fields: [userId], references: [id])
+  orders Order[]
+
+  @@index([userId])
+}
+
+// ─── MASTER DATA (small, relational, rarely changes) ──────────────────────────
+model Category {
+  id          String   @id @default(uuid())
+  name        String
+  slug        String   @unique
+  description String?
+  imageUrl    String?
+  videoUrl    String?
+  parentId    String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryTree")
+
+  @@index([parentId, isActive])
+}
+
+model Brand {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  logoUrl   String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── OUTBOX (cross-DB consistency) ─────────────────────────────────────────────
+// why: Postgres is the source of truth for Category/Brand; Product (MongoDB) denormalizes
+// their name/slug. A plain dual-write (update both DBs from the request handler) can leave
+// Mongo stale forever if it fails after Postgres already committed. Writing this row in the
+// same Postgres transaction as the source-of-truth update guarantees the event is never lost;
+// a background worker (src/workers/outbox.worker.js) relays it to Mongo with retries.
+model OutboxEvent {
+  id          String    @id @default(uuid())
+  eventType   String
+  payload     Json
+  attempts    Int       @default(0)
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+  availableAt DateTime  @default(now())
+
+  @@index([processedAt, attempts])
+  @@index([processedAt, availableAt])
+}
+
+// ─── WISHLIST ─────────────────────────────────────────────────────────────────
+// productId is a String reference to MongoDB — no FK constraint (cross-DB)
+model Wishlist {
+  userId    String
+  productId String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, productId])
+  @@index([productId, userId])
+}
+
+// ─── COUPON / DISCOUNT ────────────────────────────────────────────────────────
+enum CouponType {
+  PERCENTAGE
+  FIXED_AMOUNT
+  FREE_SHIPPING
+}
+
+enum CouponScope {
+  ALL
+  CATEGORY
+  PRODUCT
+  BRAND
+}
+
+model Coupon {
+  id          String     @id @default(uuid())
+  code        String     @unique
+  name        String
+  description String?
+  type        CouponType
+  value       Decimal    @db.Decimal(10, 2)
+  maxDiscount Decimal?   @db.Decimal(10, 2)
+
+  minOrderAmount Decimal? @db.Decimal(10, 2)
+
+  scope    CouponScope @default(ALL)
+  scopeIds String[]    @default([])
+
+  usageLimit   Int?
+  usageCount   Int  @default(0)
+  perUserLimit Int  @default(1)
+
+  startsAt  DateTime?
+  expiresAt DateTime?
+  isActive  Boolean   @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  usages CouponUsage[]
+  orders Order[]
+
+  @@index([isActive])
+  @@index([type])
+  @@index([createdAt])
+}
+
+model CouponUsage {
+  id       String   @id @default(uuid())
+  couponId String
+  userId   String
+  orderId  String?
+  discount Decimal  @db.Decimal(10, 2)
+  usedAt   DateTime @default(now())
+
+  coupon Coupon @relation(fields: [couponId], references: [id], onDelete: Cascade)
+
+  @@index([couponId, userId])
+  @@index([userId])
+}
+
+// ─── ORDERS & PAYMENTS ────────────────────────────────────────────────────────
+
+enum OrderStatus {
+  PENDING
+  AWAITING_PAYMENT
+  PAID
+  PROCESSING
+  SHIPPED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentMethod {
+  BANK_TRANSFER
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  PARTIALLY_REFUNDED
+  FAILED
+  REFUNDED
+}
+
+enum RefundStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+enum ReturnStatus {
+  REQUESTED
+  INSPECTING
+  APPROVED
+  REJECTED
+  REFUNDED
+  NO_REFUND
+}
+
+model Order {
+  id              String  @id @default(uuid())
+  userId          String
+  idempotencyKey  String?
+  addressId       String?
+  shippingCarrier String?
+  trackingNumber  String?
+  trackingUrl     String?
+
+  // why: snapshot of the shipping address at order-creation time — Order must
+  // never rewrite its own history when the user later edits/deletes that saved
+  // Address, and deleting an Address must never be blocked by past orders.
+  shippingFullName    String?
+  shippingPhone       String?
+  shippingStreet      String?
+  shippingWard        String?
+  shippingDistrict    String?
+  shippingCity        String?
+  shippingPostalCode  String?
+  shippingCountryCode String?
+
+  subtotal       Decimal @db.Decimal(12, 2)
+  shippingFee    Decimal @default(0) @db.Decimal(12, 2)
+  discountAmount Decimal @default(0) @db.Decimal(12, 2)
+  total          Decimal @db.Decimal(12, 2)
+
+  status          OrderStatus @default(PENDING)
+  statusChangedAt DateTime    @default(now())
+  note            String?
+
+  couponId   String?
+  couponCode String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user           User                 @relation(fields: [userId], references: [id])
+  address        Address?             @relation(fields: [addressId], references: [id], onDelete: SetNull)
+  coupon         Coupon?              @relation(fields: [couponId], references: [id])
+  items          OrderItem[]
+  payment        Payment?
+  refunds        Refund[]
+  statusHistory  OrderStatusHistory[]
+  returnRequests ReturnRequest[]
+
+  @@unique([userId, idempotencyKey])
+  @@index([status, createdAt])
+  @@index([userId, status, createdAt])
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([status, statusChangedAt])
+  @@index([total(sort: Desc), createdAt(sort: Desc), id(sort: Desc)])
+}
+
+model OrderStatusHistory {
+  id              String      @id @default(uuid())
+  orderId         String
+  fromStatus      OrderStatus
+  toStatus        OrderStatus
+  changedByUserId String?
+  reason          String?
+  createdAt       DateTime    @default(now())
+
+  order     Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  changedBy User? @relation("OrderStatusChangedBy", fields: [changedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([orderId, createdAt])
+}
+
+model OrderItem {
+  id      String @id @default(uuid())
+  orderId String
+
+  productId   String
+  variantId   String
+  productName String
+  variantName String
+  variantSku  String
+  image       String?
+
+  price    Decimal @db.Decimal(12, 2)
+  quantity Int
+  subtotal Decimal @db.Decimal(12, 2)
+
+  order       Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  returnItems ReturnRequestItem[]
+
+  @@index([orderId])
+}
+
+model Payment {
+  id             String        @id @default(uuid())
+  orderId        String        @unique
+  method         PaymentMethod
+  status         PaymentStatus @default(PENDING)
+  amount         Decimal       @db.Decimal(12, 2)
+  refundedAmount Decimal       @default(0) @db.Decimal(12, 2)
+
+  transferContent String? // reference code shown in the QR / bank transfer message, used to match this order to an incoming transfer
+  confirmedBy     String? // admin userId who manually confirmed the transfer arrived
+
+  paidAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order           Order @relation(fields: [orderId], references: [id])
+  confirmedByUser User? @relation("PaymentConfirmedBy", fields: [confirmedBy], references: [id], onDelete: SetNull)
+}
+
+model Refund {
+  id              String       @id @default(uuid())
+  orderId         String
+  amount          Decimal      @db.Decimal(12, 2)
+  reason          String
+  transactionId   String       @unique
+  status          RefundStatus @default(COMPLETED)
+  approvedBy      String
+  processedAt     DateTime     @default(now())
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  returnRequestId String?      @unique
+
+  order          Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  approvedByUser User           @relation("RefundApprovedBy", fields: [approvedBy], references: [id])
+  returnRequest  ReturnRequest? @relation(fields: [returnRequestId], references: [id])
+
+  @@index([orderId, createdAt])
+  @@index([status, createdAt])
+}
+
+model ReturnRequest {
+  id               String       @id @default(uuid())
+  orderId          String
+  userId           String
+  status           ReturnStatus @default(REQUESTED)
+  reason           String
+  evidenceImages   String[]     @default([])
+  customerNote     String?
+  inspectionResult String?
+  inspectedBy      String?
+  inspectedAt      DateTime?
+  refundAmount     Decimal?     @db.Decimal(12, 2)
+  resolvedAt       DateTime?
+  restockedAt      DateTime?
+  refundedAt       DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  order       Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  requestedBy User                @relation("ReturnRequestedBy", fields: [userId], references: [id])
+  inspector   User?               @relation("ReturnInspectedBy", fields: [inspectedBy], references: [id], onDelete: SetNull)
+  items       ReturnRequestItem[]
+  refund      Refund?
+
+  @@index([orderId, status])
+  @@index([status, createdAt])
+  @@index([userId, createdAt])
+}
+
+model ReturnRequestItem {
+  returnRequestId String
+  orderItemId     String
+  quantity        Int
+  restockable     Boolean @default(false)
+
+  returnRequest ReturnRequest @relation(fields: [returnRequestId], references: [id], onDelete: Cascade)
+  orderItem     OrderItem     @relation(fields: [orderItemId], references: [id])
+
+  @@id([returnRequestId, orderItemId])
+  @@index([orderItemId])
+}
+
+// ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
+enum NotificationType {
+  ORDER_CREATED
+  ORDER_STATUS_CHANGED
+  WISHLIST_PRICE_DROP
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  orderId   String?
+  eventKey  String?          @unique
+  type      NotificationType
+  title     String
+  message   String
+  link      String?
+  isRead    Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead, createdAt])
+}
